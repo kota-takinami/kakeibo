@@ -1,9 +1,16 @@
 // -------------------------
 // クレジットカード明細（CSV）の取り込み
-// 三井住友カード（Vpass）の CSV 形式に対応
+// 次の2つの形式に対応（どちらかは自動で見分ける）
+//
+// 三井住友カード（Vpass）：Shift_JIS
 //   1行目：  名前 様,カード番号,カード名
 //   明細行： 利用日,利用店名,利用金額,支払区分,回数,今回支払額,備考
 //   最終行： ,,,,,合計
+//
+// 楽天カード（楽天e-NAVI）：UTF-8、すべての列が "..." で囲まれている
+//   1行目：  "利用日","利用店名・商品名","利用者","支払方法","利用金額",…,"新規サイン"
+//   明細行： "2026/09/30","店名","本人","1回払い","890",…,"*"
+//   補足行： 利用日が空の行（海外利用の金額、ETC の区間など）は、直前の明細の補足
 // -------------------------
 
 import { CARD_METHOD } from './calc.js';
@@ -44,48 +51,121 @@ export function merchantKey(name) {
   return tidy(name).toLowerCase().replace(/[\s\-‐‑‒–—―−ーｰ・/／]/g, '');
 }
 
+// キーワードで探すための形（小さい「ッ」「ャ」なども大きい字にそろえる）
+// 半角カナの「ﾈﾂﾄﾌﾘﾂｸｽ」と「ネットフリックス」を同じものとして見つけるため
+const SMALL_KANA = { 'ァ': 'ア', 'ィ': 'イ', 'ゥ': 'ウ', 'ェ': 'エ', 'ォ': 'オ', 'ッ': 'ツ', 'ャ': 'ヤ', 'ュ': 'ユ', 'ョ': 'ヨ', 'ヮ': 'ワ' };
+const matchKey = name => merchantKey(name).replace(/[ァィゥェォッャュョヮ]/g, c => SMALL_KANA[c]);
+
 const pad = n => String(n).padStart(2, '0');
 
+const toDate = value => {
+  const m = tidy(value || '').match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+  return m ? `${m[1]}-${pad(m[2])}-${pad(m[3])}` : null;
+};
+
+const toAmount = value => Number(tidy(value || '').replace(/[,¥\\円]/g, ''));
+
+// 電子マネーへのチャージは「お金の移動」で、買い物そのものではない
+const isCharge = name => /チヤジ|ペイ残高|ペイザンダカ/.test(matchKey(name));
+
 export function parseCardCsv(text) {
-  const lines = text.split(/\r\n|\n|\r|\u0085/).filter(l => l.trim());
+  const lines = text.replace(/^﻿/, '').split(/\r\n|\n|\r|\u0085/).filter(l => l.trim());
   const header = splitCsvLine(lines[0] || '');
-  const rows = [];
+  const isRakuten = header[0] === '利用日';
+  const raw = isRakuten ? parseRakuten(lines.slice(1)) : parseVpass(lines);
+  const cardName = isRakuten ? '楽天カード' : tidy(header[2] || '');
+  const billMonth = isRakuten ? findBillMonth(header, raw) : null;
+
+  // 同じ日・同じ店・同じ金額が2件あっても区別できるよう、何件目かを付ける
   const seen = new Map();
+  const rows = raw.map(r => {
+    const memoParts = [r.name];
+    if (r.note && r.note !== r.name && !r.name.includes(r.note)) memoParts.push(`（${r.note}）`);
+    if (r.installments > 1) memoParts.push(`（${r.installments}回払い）`);
+    if (r.amount < 0) memoParts.push('（返品・取消）');
 
-  for (const line of lines) {
-    const cols = splitCsvLine(line);
-    const date = cols[0].match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
-    if (!date) continue;
-
-    const amount = Number(tidy(cols[2] || '').replace(/,/g, ''));
-    if (!amount) continue;
-
-    const dateStr = `${date[1]}-${pad(date[2])}-${pad(date[3])}`;
-    const name = tidy(cols[1] || '').replace(/\/NFC$/i, '');
-    const installments = Number(tidy(cols[3] || '1')) || 1;
-    const note = tidy(cols[6] || '');
-
-    const memoParts = [name];
-    if (note && note !== name && !name.includes(note)) memoParts.push(`（${note}）`);
-    if (installments > 1) memoParts.push(`（${installments}回払い）`);
-    if (amount < 0) memoParts.push('（返品・取消）');
-
-    // 同じ日・同じ店・同じ金額が2件あっても区別できるよう、何件目かを付ける
-    const base = `${dateStr}|${amount}|${merchantKey(name)}`;
+    const base = `${r.date}|${r.amount}|${merchantKey(r.name)}`;
     const count = (seen.get(base) || 0) + 1;
     seen.set(base, count);
 
-    rows.push({
-      date: dateStr,
-      name,
-      amount,
+    return {
+      date: r.date,
+      name: r.name,
+      amount: r.amount,
       memo: memoParts.join(''),
-      merchant: merchantKey(name),
-      importKey: `${base}|${count}`
+      merchant: merchantKey(r.name),
+      importKey: `${base}|${count}`,
+      // 最初はチェックを外しておく理由（なければ null）
+      skipReason: r.carried ? 'carried' : isCharge(r.name) ? 'charge' : null
+    };
+  });
+
+  return { cardName, billMonth, rows };
+}
+
+// 楽天カードの見出し「10月支払金額」から、引き落とされる年月（"2026-10"）を出す
+// ETC のように遅れて請求される利用分も、この明細の月に引き落とされる
+function findBillMonth(header, rows) {
+  const month = header.map(h => h.match(/^(\d{1,2})月支払金額$/)).find(Boolean);
+  const latest = rows.filter(r => !r.carried).map(r => r.date).sort().at(-1);
+  if (!month || !latest) return null;
+  const m = Number(month[1]);
+  const year = Number(latest.slice(0, 4)) + (m < Number(latest.slice(5, 7)) ? 1 : 0);
+  return `${year}-${pad(m)}`;
+}
+
+function parseVpass(lines) {
+  const rows = [];
+  for (const line of lines) {
+    const cols = splitCsvLine(line);
+    const date = toDate(cols[0]);
+    const amount = toAmount(cols[2]);
+    if (!date || !amount) continue;
+
+    rows.push({
+      date,
+      name: tidy(cols[1] || '').replace(/\/NFC$/i, ''),
+      amount,
+      installments: toAmount(cols[3]) || 1,
+      // 分割の2回目以降は、前の月の明細ですでに出ている買い物
+      carried: (toAmount(cols[4]) || 1) > 1,
+      note: tidy(cols[6] || '')
     });
   }
+  return rows;
+}
 
-  return { cardName: tidy(header[2] || ''), rows };
+function parseRakuten(lines) {
+  const rows = [];
+  for (const line of lines) {
+    const cols = splitCsvLine(line);
+    const date = toDate(cols[0]);
+
+    // 利用日が空の行は、直前の明細の補足
+    if (!date) {
+      const last = rows[rows.length - 1];
+      const text = tidy(cols[1] || '');
+      if (!last || !text) continue;
+      const purchase = text.match(/ご利用金額[:：]\s*[\\¥]?([\d,]+)/);
+      if (purchase && !last.amount) last.amount = toAmount(purchase[1]);
+      // 海外利用の換算や分割の購入金額は、メモに入れなくてよい
+      if (!/^(現地利用額|購入金額|ご利用金額)/.test(text)) last.note = text;
+      continue;
+    }
+
+    const plan = tidy(cols[3] || '').match(/(\d+)回払い(?:\((\d+)回目\))?/);
+    rows.push({
+      date,
+      // 海外利用は「SPOTIFY利用国SWE」のように国名が付くので外す
+      name: tidy(cols[1] || '').replace(/利用国[A-Z]{3}$/, '').trim(),
+      amount: toAmount(cols[4]) || 0,
+      installments: plan ? Number(plan[1]) : 1,
+      // 新規サイン（*）がない行は、前の月までの明細の続き（分割の2回目以降など）
+      carried: tidy(cols[10] || '') !== '*',
+      note: ''
+    });
+  }
+  return rows.filter(r => r.amount);
 }
 
 // -------------------------
@@ -98,17 +178,17 @@ export function parseCardCsv(text) {
 const KEYWORD_RULES = [
   ['食費', ['ローソン', 'セブンイレブン', 'ファミリーマート', 'ミニストップ', 'デイリーヤマザキ', 'すき家', '吉野家', '松屋', 'マクドナルド', 'モスバーガー', 'ケンタッキー', 'スターバックス', 'ドトール', 'タリーズ', 'コメダ', 'サイゼリヤ', 'ガスト', 'くら寿司', 'スシロー', 'はま寿司', '原信', 'バロー', 'イオン', 'ウオロク', '清水フードセンター', 'シャトレーゼ', 'ナルス', 'スーパー', 'ベーカリー', '食堂', 'ラーメン', 'カフェ', 'cafe', 'coffee']],
   ['日用品', ['ココカラファイン', 'ウエルシア', 'マツモトキヨシ', 'スギ薬局', 'ツルハ', 'クスリのアオキ', 'ドラッグ', '無印良品', 'セリア', 'ダイソー', 'キャンドゥ', 'ニトリ', 'ホームセンター', 'ムサシ', 'コメリ', 'カインズ', 'ケーヨー']],
-  ['車・ガソリン', ['駐車場', 'パーキング', 'parkdirect', 'タイムズ', 'eneos', 'エネオス', '出光', 'コスモ石油', 'ガソリン', 'オートバックス', 'イエローハット']],
+  ['車・ガソリン', ['駐車場', 'パーキング', 'parkdirect', 'タイムズ', 'etcカード', 'eneos', 'エネオス', '出光', 'コスモ石油', 'ガソリン', 'オートバックス', 'イエローハット']],
   ['交通費', ['jr東日本', 'jr西日本', 'jr東海', '新幹線', 'えきねっと', 'suica', 'バス', 'タクシー', '航空']],
   ['通信費', ['ドコモ', 'docomo', 'ソフトバンク', 'softbank', 'kddi', 'auじぶん', 'ahamo', 'povo', 'linemo', '楽天モバイル', 'uqモバイル', 'ワイモバイル', 'ymobile']],
-  ['サブスク', ['netflix', 'spotify', 'applecom', 'apple', 'amazonプライム', 'prime', 'youtube', 'disney', 'hulu', 'uネクスト', 'unext', 'adobe', 'chatgpt', 'openai', 'claude']],
+  ['サブスク', ['netflix', 'ネットフリックス', 'spotify', 'スポティファイ', 'applecom', 'apple', 'amazonプライム', 'prime', 'youtube', 'グーグルプレイ', 'googleplay', 'disney', 'hulu', 'uネクスト', 'unext', 'adobe', 'chatgpt', 'openai', 'claude', 'フィットネス', 'fit365', 'エニタイム', 'チョコザップ']],
   ['衣服', ['zozotown', 'ユニクロ', 'uniqlo', 'ジーユー', 'しまむら', 'モンベル', 'ワークマン', 'abcマート']],
   ['医療', ['病院', 'クリニック', '医院', '歯科', '薬局']],
   ['教育・研究', ['書店', '紀伊國屋', 'ジュンク堂', '蔦屋', '丸善', '生協']],
   ['娯楽・交際費', ['山荘', 'ホテル', '旅館', '温泉', '映画', 'シネマ', 'カラオケ', 'ゲーム', 'パーク', 'ロープウェイ', 'スキー', 'チケット']]
 ];
 
-const RULES = KEYWORD_RULES.map(([category, words]) => [category, words.map(merchantKey)]);
+const RULES = KEYWORD_RULES.map(([category, words]) => [category, words.map(matchKey)]);
 
 export function guessCategory(row, data) {
   const categories = data.categories.expense;
@@ -119,8 +199,9 @@ export function guessCategory(row, data) {
     .sort((a, b) => b.date.localeCompare(a.date))[0];
   if (past) return past.category;
 
+  const key = matchKey(row.name);
   for (const [category, words] of RULES) {
-    if (categories.includes(category) && words.some(w => row.merchant.includes(w))) return category;
+    if (categories.includes(category) && words.some(w => key.includes(w))) return category;
   }
   return categories.includes('その他') ? 'その他' : categories[0];
 }

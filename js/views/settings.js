@@ -6,7 +6,7 @@
 import { getData, update, uid, exportJSON, importJSON, METHODS } from '../store.js';
 import {
   todayStr, monthOf, addMonths, yen, formatDate, formatFullDate, daysUntil,
-  generateFixedCosts, fixedMonthlyTotal, applyDueDate, isCardPaid, CARD_METHOD
+  generateFixedCosts, fixedMonthlyTotal, applyDueDate, isCardPaid, dayInMonth, CARD_METHOD
 } from '../calc.js';
 import { esc, options, formData, openSheet, toast } from '../ui.js';
 import { decodeCsv, parseCardCsv, merchantKey, guessCategory, markDuplicates } from '../cardImport.js';
@@ -53,7 +53,7 @@ export function render(root) {
         📄 カード明細（CSV）を取り込む
         <input type="file" accept=".csv,text/csv" data-card-csv hidden>
       </label>
-      <p class="note">Vpass からダウンロードした明細の CSV を選ぶと、まとめて記録できます。</p>
+      <p class="note">三井住友カード（Vpass）・楽天カード（楽天e-NAVI）の明細 CSV を選ぶと、まとめて記録できます。</p>
 
       <h3 class="section-title"><span>カテゴリ</span></h3>
       <div class="list">
@@ -349,6 +349,15 @@ function editCategories(type, onDone) {
 // 一覧で確認・カテゴリの修正をしてから記録する
 // -------------------------
 
+// 一覧の各行に付ける説明
+function statusLabel(row) {
+  if (row.duplicate === 'imported') return ' ・ 取り込み済み';
+  if (row.duplicate === 'manual') return ' ・ 手入力あり';
+  if (row.skipReason === 'carried') return ' ・ 前の月からの分割';
+  if (row.skipReason === 'charge') return ' ・ チャージ';
+  return '';
+}
+
 export function importCardStatement(buffer, onDone) {
   const data = getData();
   if (data.cards.length === 0) {
@@ -378,7 +387,7 @@ export function importCardStatement(buffer, onDone) {
     rows = markDuplicates(parsed.rows, data, cardName).map((row, i) => ({
       ...row,
       category: rows[i]?.category || guessCategory(row, data),
-      checked: !row.duplicate
+      checked: !row.duplicate && !row.skipReason
     }));
   };
   refreshDuplicates();
@@ -391,8 +400,10 @@ export function importCardStatement(buffer, onDone) {
   const body = `
     <form id="card-import-form">
       <label class="field"><span>記録するカード</span><select name="card">${cardOptions()}</select></label>
+      ${matched ? '' : `<p class="note" style="margin:-6px 0 10px;color:var(--warn)">⚠ 「${esc(parsed.cardName)}」に合うカードが登録されていません。記録するカードを確認するか、先に設定でカードを追加してください。</p>`}
       <p class="note" style="margin:0 0 4px">${esc(parsed.cardName || 'CSV')} ・ ${parsed.rows.length}件 ・ 利用額の合計 ${yen(total)}</p>
       <p class="note" id="duplicate-note" style="margin:0 0 10px"></p>
+      <p class="note" id="charge-note" style="margin:0 0 10px" hidden>チャージは、お金を電子マネーに移しただけで、買い物ではありません。楽天ペイなどで払った分を別に記録しているなら、チャージは取り込まないでください（二重に数えてしまうため）。使った分を記録していないなら、チェックを入れて取り込んでください。</p>
       <div class="list import-list" id="import-rows"></div>
       <p class="note">カテゴリは店名から推測しています。取り込んだ後に直すと、次からはそのカテゴリになります。</p>
       <div class="btn-row sheet-actions">
@@ -408,12 +419,17 @@ export function importCardStatement(buffer, onDone) {
       const count = rows.filter(r => r.checked).length;
       const imported = rows.filter(r => r.duplicate === 'imported').length;
       const manual = rows.filter(r => r.duplicate === 'manual').length;
+      const carried = rows.filter(r => !r.duplicate && r.skipReason === 'carried').length;
+      const charge = rows.filter(r => !r.duplicate && r.skipReason === 'charge').length;
       const notes = [];
       if (imported) notes.push(`取り込み済み ${imported}件`);
       if (manual) notes.push(`手入力と重複していそうな ${manual}件`);
+      if (carried) notes.push(`前の月からの分割払い ${carried}件`);
+      if (charge) notes.push(`電子マネーへのチャージ ${charge}件`);
       sheet.querySelector('#duplicate-note').textContent = notes.length
         ? `⚠ ${notes.join('、')}はチェックを外しています。`
         : '';
+      sheet.querySelector('#charge-note').hidden = charge === 0;
       const submit = sheet.querySelector('#import-submit');
       submit.textContent = `${count}件を取り込む`;
       submit.disabled = count === 0;
@@ -425,7 +441,7 @@ export function importCardStatement(buffer, onDone) {
           <input type="checkbox" data-check="${i}"${row.checked ? ' checked' : ''} aria-label="${esc(row.name)}を取り込む">
           <div class="main">
             <div class="title">${esc(row.memo)}</div>
-            <div class="sub">${formatDate(row.date)}${row.duplicate === 'imported' ? ' ・ 取り込み済み' : row.duplicate === 'manual' ? ' ・ 手入力あり' : ''}</div>
+            <div class="sub">${formatDate(row.date)}${statusLabel(row)}</div>
             <select data-category="${i}" aria-label="カテゴリ">${options(data.categories.expense, row.category)}</select>
           </div>
           <div class="amount">${yen(row.amount)}</div>
@@ -467,7 +483,11 @@ export function importCardStatement(buffer, onDone) {
             merchant: row.merchant,
             importKey: row.importKey
           };
-          d.transactions.push(applyDueDate(tx, d.cards));
+          applyDueDate(tx, d.cards);
+          // 明細に引落月が書いてあれば、そちらを使う
+          const card = d.cards.find(c => c.name === cardName);
+          if (parsed.billMonth && card) tx.dueDate = dayInMonth(parsed.billMonth, card.paymentDay);
+          d.transactions.push(tx);
         }
         d.settings.lastCard = cardName;
       });
