@@ -5,10 +5,11 @@
 
 import { getData, update, uid, exportJSON, importJSON, METHODS } from '../store.js';
 import {
-  todayStr, monthOf, addMonths, yen, formatFullDate, daysUntil,
+  todayStr, monthOf, addMonths, yen, formatDate, formatFullDate, daysUntil,
   generateFixedCosts, fixedMonthlyTotal, applyDueDate, isCardPaid, CARD_METHOD
 } from '../calc.js';
 import { esc, options, formData, openSheet, toast } from '../ui.js';
+import { decodeCsv, parseCardCsv, merchantKey, guessCategory, markDuplicates } from '../cardImport.js';
 
 export function render(root) {
   const data = getData();
@@ -48,6 +49,11 @@ export function render(root) {
             </div>
           </button>`).join('')}
       </div>
+      <label class="btn block" style="margin-top:10px">
+        📄 カード明細（CSV）を取り込む
+        <input type="file" accept=".csv,text/csv" data-card-csv hidden>
+      </label>
+      <p class="note">Vpass からダウンロードした明細の CSV を選ぶと、まとめて記録できます。</p>
 
       <h3 class="section-title"><span>カテゴリ</span></h3>
       <div class="list">
@@ -98,6 +104,12 @@ export function render(root) {
   section.querySelector('[data-import]').addEventListener('change', e => {
     const file = e.target.files[0];
     if (file) importBackup(file);
+  });
+
+  section.querySelector('[data-card-csv]').addEventListener('change', async e => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (file) importCardStatement(await file.arrayBuffer(), rerender);
   });
 
   navigator.storage?.persisted?.().then(persisted => {
@@ -329,6 +341,142 @@ function editCategories(type, onDone) {
       toast('保存しました');
       onDone();
     });
+  });
+}
+
+// -------------------------
+// カード明細（CSV）の取り込み
+// 一覧で確認・カテゴリの修正をしてから記録する
+// -------------------------
+
+export function importCardStatement(buffer, onDone) {
+  const data = getData();
+  if (data.cards.length === 0) {
+    toast('先にクレジットカードを登録してください');
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = parseCardCsv(decodeCsv(buffer));
+  } catch (e) {
+    console.error(e);
+  }
+  if (!parsed || parsed.rows.length === 0) {
+    toast('明細が見つかりませんでした。Vpass の CSV か確認してください');
+    return;
+  }
+
+  // CSV のカード名に近い、登録済みのカードを選んでおく
+  const csvKey = merchantKey(parsed.cardName);
+  const matched = data.cards.find(c => csvKey.includes(merchantKey(c.name)) || merchantKey(c.name).includes(csvKey));
+  let cardName = (matched || data.cards.find(c => c.name === data.settings.lastCard) || data.cards[0]).name;
+
+  // 画面で変えられる状態（チェックとカテゴリ）
+  let rows = [];
+  const refreshDuplicates = () => {
+    rows = markDuplicates(parsed.rows, data, cardName).map((row, i) => ({
+      ...row,
+      category: rows[i]?.category || guessCategory(row, data),
+      checked: !row.duplicate
+    }));
+  };
+  refreshDuplicates();
+
+  const total = parsed.rows.reduce((sum, r) => sum + r.amount, 0);
+  const cardOptions = () => data.cards
+    .map(c => `<option value="${esc(c.name)}"${c.name === cardName ? ' selected' : ''}>${esc(c.name)}</option>`)
+    .join('');
+
+  const body = `
+    <form id="card-import-form">
+      <label class="field"><span>記録するカード</span><select name="card">${cardOptions()}</select></label>
+      <p class="note" style="margin:0 0 4px">${esc(parsed.cardName || 'CSV')} ・ ${parsed.rows.length}件 ・ 利用額の合計 ${yen(total)}</p>
+      <p class="note" id="duplicate-note" style="margin:0 0 10px"></p>
+      <div class="list import-list" id="import-rows"></div>
+      <p class="note">カテゴリは店名から推測しています。取り込んだ後に直すと、次からはそのカテゴリになります。</p>
+      <div class="btn-row sheet-actions">
+        <button type="submit" class="btn primary" id="import-submit"></button>
+      </div>
+    </form>`;
+
+  openSheet('カード明細の取り込み', body, (sheet, close) => {
+    const form = sheet.querySelector('#card-import-form');
+    const list = sheet.querySelector('#import-rows');
+
+    const refreshSummary = () => {
+      const count = rows.filter(r => r.checked).length;
+      const imported = rows.filter(r => r.duplicate === 'imported').length;
+      const manual = rows.filter(r => r.duplicate === 'manual').length;
+      const notes = [];
+      if (imported) notes.push(`取り込み済み ${imported}件`);
+      if (manual) notes.push(`手入力と重複していそうな ${manual}件`);
+      sheet.querySelector('#duplicate-note').textContent = notes.length
+        ? `⚠ ${notes.join('、')}はチェックを外しています。`
+        : '';
+      const submit = sheet.querySelector('#import-submit');
+      submit.textContent = `${count}件を取り込む`;
+      submit.disabled = count === 0;
+    };
+
+    const renderRows = () => {
+      list.innerHTML = rows.map((row, i) => `
+        <label class="list-row import-row${row.checked ? '' : ' unchecked'}">
+          <input type="checkbox" data-check="${i}"${row.checked ? ' checked' : ''} aria-label="${esc(row.name)}を取り込む">
+          <div class="main">
+            <div class="title">${esc(row.memo)}</div>
+            <div class="sub">${formatDate(row.date)}${row.duplicate === 'imported' ? ' ・ 取り込み済み' : row.duplicate === 'manual' ? ' ・ 手入力あり' : ''}</div>
+            <select data-category="${i}" aria-label="カテゴリ">${options(data.categories.expense, row.category)}</select>
+          </div>
+          <div class="amount">${yen(row.amount)}</div>
+        </label>`).join('');
+      refreshSummary();
+    };
+
+    form.card.addEventListener('change', () => {
+      cardName = form.card.value;
+      refreshDuplicates();
+      renderRows();
+    });
+
+    list.addEventListener('change', e => {
+      const el = e.target;
+      if (el.dataset.check) {
+        rows[el.dataset.check].checked = el.checked;
+        el.closest('.import-row').classList.toggle('unchecked', !el.checked);
+        refreshSummary();
+      } else if (el.dataset.category) {
+        rows[el.dataset.category].category = el.value;
+      }
+    });
+
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const selected = rows.filter(r => r.checked);
+      update(d => {
+        for (const row of selected) {
+          const tx = {
+            id: uid(),
+            date: row.date,
+            type: 'expense',
+            amount: row.amount,
+            category: row.category,
+            method: CARD_METHOD,
+            card: cardName,
+            memo: row.memo,
+            merchant: row.merchant,
+            importKey: row.importKey
+          };
+          d.transactions.push(applyDueDate(tx, d.cards));
+        }
+        d.settings.lastCard = cardName;
+      });
+      close();
+      toast(`${selected.length}件を取り込みました`);
+      onDone();
+    });
+
+    renderRows();
   });
 }
 

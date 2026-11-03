@@ -423,6 +423,24 @@ button.list-row:active { background: var(--surface-2); }
 
 .list-row .amount .sub { text-align: right; font-weight: 400; }
 
+/* カード明細の取り込み */
+.import-list { background: var(--surface-2); }
+.import-row { align-items: flex-start; cursor: pointer; }
+.import-row input[type="checkbox"] { margin-top: 2px; flex-shrink: 0; }
+.import-row .title { white-space: normal; font-size: 15px; }
+.import-row.unchecked .main, .import-row.unchecked .amount { opacity: 0.45; }
+.import-row select { width: auto; min-width: 9em; min-height: 34px; margin-top: 6px; padding: 4px 8px; background: var(--surface); }
+
+.sheet-actions {
+  position: sticky;
+  bottom: 0;
+  background: var(--surface);
+  padding: 10px 0 4px;
+  margin-top: 8px;
+}
+
+.btn:disabled { opacity: 0.4; }
+
 .date-heading {
   font-size: 13px;
   color: var(--text-muted);
