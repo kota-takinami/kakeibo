@@ -17,6 +17,7 @@ const APP_FILES = [
   './js/calc.js',
   './js/ui.js',
   './js/cardImport.js',
+  './js/brokerImport.js',
   './js/views/add.js',
   './js/views/history.js',
   './js/views/assets.js',

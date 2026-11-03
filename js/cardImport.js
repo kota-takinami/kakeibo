@@ -25,7 +25,7 @@ export function decodeCsv(buffer) {
 }
 
 // 1行を列に分ける（"..." で囲まれた列の中のカンマにも対応）
-function splitCsvLine(line) {
+export function splitCsvLine(line) {
   const cells = [];
   let cell = '';
   let quoted = false;
@@ -44,7 +44,7 @@ function splitCsvLine(line) {
 }
 
 // 全角英数字を半角に、全角スペースを半角にそろえる
-const tidy = s => s.normalize('NFKC').replace(/\s+/g, ' ').trim();
+export const tidy = s => s.normalize('NFKC').replace(/\s+/g, ' ').trim();
 
 // 店名を比べるための形（記号・空白・長音の違いを無視する）
 export function merchantKey(name) {

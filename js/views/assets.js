@@ -9,6 +9,8 @@ import {
   assetSummary, investmentTotals, pointBalances, unpaidCardBills, snapshotAssets
 } from '../calc.js';
 import { esc, options, formData, openSheet, toast, drawChart, cssVar, shortYen } from '../ui.js';
+import { decodeCsv } from '../cardImport.js';
+import { parseHoldingsCsv, planHoldingsImport, BROKER, DEPOSIT_NAME } from '../brokerImport.js';
 
 const INVESTMENT_KINDS = ['投資信託', '日本株', '米国株', 'ETF', '債券', 'その他'];
 
@@ -83,13 +85,17 @@ export function render(root) {
             <button type="button" class="list-row" data-investment="${esc(item.id)}">
               <div class="main">
                 <div class="title">${esc(item.name)}</div>
-                <div class="sub">${esc(item.kind)} ・ ${esc(item.broker)} ・ ${item.updatedAt ? `${formatDate(item.updatedAt)}更新` : ''}</div>
+                <div class="sub">${[item.kind, item.account, item.broker, item.updatedAt ? `${formatDate(item.updatedAt)}更新` : ''].filter(Boolean).map(esc).join(' ・ ')}</div>
               </div>
               <div class="amount">${yen(item.value)}<div class="sub ${gain < 0 ? 'expense' : 'income'}">${signedYen(gain)}（${rate >= 0 ? '+' : ''}${rate.toFixed(1)}%）</div></div>
             </button>`;
         }).join('')}
       </div>
-      <p class="note">証券アプリを見て、タップで評価額を更新してください。</p>
+      <label class="btn block" style="margin-top:10px">
+        📄 楽天証券の保有商品（CSV）で更新
+        <input type="file" accept=".csv,text/csv" data-holdings-csv hidden>
+      </label>
+      <p class="note">楽天証券の「保有商品一覧」の CSV を選ぶと、評価額をまとめて更新できます。1つずつ直すときはタップしてください。</p>
 
       <h3 class="section-title">
         <span>ポイント</span>
@@ -128,6 +134,12 @@ export function render(root) {
     else if (ds.investment) editInvestment(ds.investment, rerender);
     else if ('addProgram' in ds) editProgram(null, rerender);
     else if (ds.program) editProgram(ds.program, rerender);
+  });
+
+  section.querySelector('[data-holdings-csv]').addEventListener('change', async e => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (file) importHoldings(await file.arrayBuffer(), rerender);
   });
 
   const canvas = section.querySelector('#asset-chart');
@@ -202,6 +214,111 @@ function editCash(onDone) {
 }
 
 // -------------------------
+// 楽天証券の保有商品（CSV）の取り込み
+// 一覧で確認してから、評価額の更新・追加・削除をまとめて行う
+// -------------------------
+
+const ACTION_LABELS = { update: '更新', add: '新規', remove: 'CSVにない' };
+
+export function importHoldings(buffer, onDone) {
+  let parsed;
+  try {
+    parsed = parseHoldingsCsv(decodeCsv(buffer));
+  } catch (e) {
+    console.error(e);
+  }
+  if (!parsed || parsed.holdings.length === 0) {
+    toast('保有商品が見つかりませんでした。楽天証券の「保有商品一覧」の CSV か確認してください');
+    return;
+  }
+
+  const rows = planHoldingsImport(parsed.holdings, getData().investments);
+  const holdingTotal = parsed.holdings.filter(h => h.name !== DEPOSIT_NAME).reduce((sum, h) => sum + h.value, 0);
+
+  const rowHtml = (row, i) => {
+    const sub = [row.kind, row.account].filter(Boolean).join(' ・ ');
+    let detail = `元本 ${yen(row.principal)}`;
+    if (row.action === 'update') detail = `評価額 ${yen(row.existing.value)} → ${yen(row.value)} ・ ${detail}`;
+    if (row.action === 'remove') detail = '売却済みなら、チェックを入れると削除します';
+    return `
+      <label class="list-row import-row${row.checked ? '' : ' unchecked'}">
+        <input type="checkbox" data-check="${i}"${row.checked ? ' checked' : ''} aria-label="${esc(row.name)}を反映する">
+        <div class="main">
+          <div class="title">${esc(row.name)} <span class="badge">${ACTION_LABELS[row.action]}</span></div>
+          <div class="sub">${esc(sub)}</div>
+          <div class="sub wrap">${detail}</div>
+        </div>
+        <div class="amount ${row.action === 'remove' ? 'muted' : ''}">${yen(row.value)}</div>
+      </label>`;
+  };
+
+  const body = `
+    <form id="holdings-form">
+      <p class="note" style="margin:0 0 4px">${BROKER} ・ 保有商品 ${parsed.holdings.filter(h => h.name !== DEPOSIT_NAME).length}件 ・ 評価額の合計 ${yen(holdingTotal)}${parsed.csvTotal !== null ? `（CSV の合計 ${yen(parsed.csvTotal)}）` : ''}</p>
+      <p class="note" style="margin:0 0 10px">登録済みの商品は評価額と元本を上書きし、新しい商品は追加します。「CSVにない」商品は、売却済みならチェックを入れると削除します。</p>
+      <div class="list import-list" id="holding-rows">${rows.map(rowHtml).join('')}</div>
+      <div class="btn-row sheet-actions">
+        <button type="submit" class="btn primary" id="holdings-submit"></button>
+      </div>
+    </form>`;
+
+  openSheet('保有商品の取り込み', body, (sheet, close) => {
+    const form = sheet.querySelector('#holdings-form');
+    const submit = sheet.querySelector('#holdings-submit');
+
+    const refresh = () => {
+      const count = rows.filter(r => r.checked).length;
+      submit.textContent = `${count}件を反映する`;
+      submit.disabled = count === 0;
+    };
+
+    sheet.querySelector('#holding-rows').addEventListener('change', e => {
+      const i = e.target.dataset.check;
+      if (i === undefined) return;
+      rows[i].checked = e.target.checked;
+      e.target.closest('.import-row').classList.toggle('unchecked', !e.target.checked);
+      refresh();
+    });
+
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const today = todayStr();
+      const selected = rows.filter(r => r.checked);
+
+      update(d => {
+        for (const row of selected) {
+          if (row.action === 'remove') {
+            d.investments = d.investments.filter(inv => inv.id !== row.existing.id);
+            continue;
+          }
+          const item = {
+            id: row.existing?.id || uid(),
+            broker: BROKER,
+            name: row.name,
+            kind: row.kind,
+            code: row.code,
+            account: row.account,
+            quantity: row.quantity,
+            principal: Math.round(row.principal),
+            value: Math.round(row.value),
+            updatedAt: today
+          };
+          const index = d.investments.findIndex(inv => inv.id === item.id);
+          if (index >= 0) d.investments[index] = item;
+          else d.investments.push(item);
+        }
+        snapshotAssets(d, today);
+      });
+      close();
+      toast(`${selected.length}件を反映しました`);
+      onDone();
+    });
+
+    refresh();
+  });
+}
+
+// -------------------------
 // 投資
 // -------------------------
 
@@ -236,6 +353,7 @@ function editInvestment(id, onDone) {
       e.preventDefault();
       const v = formData(form);
       const next = {
+        ...existing,
         id: existing?.id || uid(),
         broker: v.broker.trim(),
         name: v.name.trim(),
