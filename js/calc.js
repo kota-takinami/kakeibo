@@ -158,22 +158,66 @@ export function unpaidCardBills(data, today) {
 // 資産
 // -------------------------
 
-// 現金・預金 = 基準日の残高 + 基準日より後の収入 − 支出
-// カード払いは引落日に減らす
-export function cashBalance(data, today) {
-  const { baseAmount, baseDate } = data.cash;
-  let balance = Number(baseAmount) || 0;
+// -------------------------
+// 口座（財布・銀行）
+// お金がある場所ごとに、基準日の残高 + 基準日より後の出入り で残高を出す
+// -------------------------
+
+export const WALLET_ID = 'wallet';
+export const CASH_METHOD = '現金';
+
+export const bankAccounts = data => data.accounts.filter(a => a.kind === 'bank');
+
+// 銀行を選ばなかったときに使う銀行（最初に登録した銀行）
+export function defaultBankId(data) {
+  return bankAccounts(data)[0]?.id || WALLET_ID;
+}
+
+// 支出・収入のお金が出入りする口座
+// 現金払いは財布、それ以外（口座振替・QR決済など）は銀行。取引に口座が保存されていればそれを使う
+export function accountOf(tx, data) {
+  if (tx.type === 'expense' && tx.method === CARD_METHOD) {
+    const card = data.cards.find(c => c.name === tx.card);
+    return card?.accountId || defaultBankId(data);
+  }
+  if (tx.account && data.accounts.some(a => a.id === tx.account)) return tx.account;
+  if (tx.type === 'expense' && tx.method === CASH_METHOD) return WALLET_ID;
+  return defaultBankId(data);
+}
+
+// 残高を入れた日（baseDate）の取引は、残高を入れた時刻（baseAt）より後に記録したものだけ数える
+// （残高を入れたあとに ATM で引き出した、などを反映するため）
+export function accountBalances(data, today) {
+  const balances = new Map(data.accounts.map(a => [a.id, Number(a.baseAmount) || 0]));
+  const accounts = new Map(data.accounts.map(a => [a.id, a]));
+  const add = (id, date, amount, tx) => {
+    const account = accounts.get(id);
+    if (!account || date > today) return;
+    const after = date > account.baseDate ||
+      (date === account.baseDate && (tx.createdAt || 0) > (account.baseAt || 0));
+    if (after) balances.set(id, balances.get(id) + amount);
+  };
 
   for (const tx of data.transactions) {
-    if (tx.type === 'income') {
-      if (tx.date > baseDate && tx.date <= today) balance += tx.amount;
+    if (tx.type === 'transfer') {
+      add(tx.fromAccount, tx.date, -tx.amount, tx);
+      add(tx.toAccount, tx.date, tx.amount, tx);
+    } else if (tx.type === 'income') {
+      add(accountOf(tx, data), tx.date, tx.amount, tx);
     } else if (tx.method === CARD_METHOD && tx.dueDate) {
-      if (tx.dueDate > baseDate && tx.dueDate <= today) balance -= tx.amount;
-    } else if (tx.date > baseDate && tx.date <= today) {
-      balance -= tx.amount;
+      // カード払いは引落日に、カードの引落口座から減らす
+      add(accountOf(tx, data), tx.dueDate, -tx.amount, tx);
+    } else {
+      add(accountOf(tx, data), tx.date, -tx.amount, tx);
     }
   }
-  return balance;
+
+  return data.accounts.map(account => ({ account, balance: balances.get(account.id) }));
+}
+
+// 現金・預金の合計（財布と銀行をすべて足したもの）
+export function cashBalance(data, today) {
+  return sum(accountBalances(data, today).map(a => a.balance));
 }
 
 export function investmentTotals(data) {
@@ -235,6 +279,8 @@ export function monthSummary(data, ym) {
   const byCategory = new Map();
 
   for (const tx of list) {
+    // 口座間の移動（ATM で引き出すなど）は、収入にも支出にも数えない
+    if (tx.type === 'transfer') continue;
     if (tx.type === 'income') {
       income += tx.amount;
     } else if (tx.category === INVEST_CATEGORY) {
@@ -298,8 +344,10 @@ export function generateFixedCosts(data, today) {
         category: fc.category,
         method: fc.method,
         card: fc.card || '',
+        account: fc.account || '',
         memo: fc.name,
-        fixedId: fc.id
+        fixedId: fc.id,
+        createdAt: Date.now()
       };
       data.transactions.push(applyDueDate(tx, data.cards));
       done.add(key);

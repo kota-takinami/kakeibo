@@ -7,7 +7,7 @@ import { getData, update, uid, exportJSON, importJSON, METHODS } from '../store.
 import {
   todayStr, monthOf, addMonths, yen, formatDate, formatFullDate, daysUntil,
   generateFixedCosts, fixedMonthlyTotal, applyDueDate, isCardPaid, dayInMonth, recentDetails,
-  CARD_METHOD, INVEST_CATEGORY, OTHER_CATEGORY
+  bankAccounts, defaultBankId, CARD_METHOD, INVEST_CATEGORY, OTHER_CATEGORY, WALLET_ID
 } from '../calc.js';
 import { esc, options, formData, openSheet, toast } from '../ui.js';
 import { decodeCsv, parseCardCsv, merchantKey, guessCategory, guessDetail, markDuplicates } from '../cardImport.js';
@@ -38,6 +38,21 @@ export function render(root) {
       ${data.fixedCosts.length ? `<p class="note">固定費の合計：支出 ${yen(totals.expense)}／月${totals.income ? `、収入 ${yen(totals.income)}／月` : ''}</p>` : ''}
 
       <h3 class="section-title">
+        <span>財布・銀行</span>
+        <button type="button" class="link-button" data-add-bank>＋ 銀行を追加</button>
+      </h3>
+      <div class="list">
+        ${data.accounts.map(account => `
+          <button type="button" class="list-row" data-account="${esc(account.id)}">
+            <div class="main">
+              <div class="title">${account.kind === 'cash' ? '👛' : '🏦'} ${esc(account.name)}</div>
+              <div class="sub">${account.kind === 'cash' ? '現金払い' : account.id === defaultBankId(data) ? '口座振替・QR決済など（最初に選ばれる銀行）' : '口座振替・QR決済など'}</div>
+            </div>
+          </button>`).join('')}
+      </div>
+      <p class="note">残高は「資産」タブで合わせます。</p>
+
+      <h3 class="section-title">
         <span>クレジットカード</span>
         <button type="button" class="link-button" data-add-card>＋ 追加</button>
       </h3>
@@ -46,7 +61,7 @@ export function render(root) {
           <button type="button" class="list-row" data-card="${esc(card.id)}">
             <div class="main">
               <div class="title">💳 ${esc(card.name)}</div>
-              <div class="sub">${card.closingDay >= 31 ? '月末' : `毎月${card.closingDay}日`}締め ・ 翌月${card.paymentDay >= 31 ? '末' : `${card.paymentDay}日`}引落</div>
+              <div class="sub">${card.closingDay >= 31 ? '月末' : `毎月${card.closingDay}日`}締め ・ 翌月${card.paymentDay >= 31 ? '末' : `${card.paymentDay}日`}引落 ・ ${esc(data.accounts.find(a => a.id === (card.accountId || defaultBankId(data)))?.name || '')}</div>
             </div>
           </button>`).join('')}
       </div>
@@ -97,6 +112,8 @@ export function render(root) {
     if ('addFixed' in ds) editFixedCost(null, rerender);
     else if (ds.fixed) editFixedCost(ds.fixed, rerender);
     else if ('addCard' in ds) editCard(null, rerender);
+    else if ('addBank' in ds) editAccount(null, rerender);
+    else if (ds.account) editAccount(ds.account, rerender);
     else if (ds.card) editCard(ds.card, rerender);
     else if (ds.categories) editCategories(ds.categories, rerender);
     else if ('export' in ds) exportBackup(rerender);
@@ -161,6 +178,7 @@ function editFixedCost(id, onDone) {
         <label class="field"><span>支払方法</span><select name="method">${options(METHODS, fc.method)}</select></label>
         <label class="field" id="card-field"><span>カード</span><select name="card">${options(data.cards.map(c => c.name), fc.card)}</select></label>
       </div>
+      <label class="field" id="bank-field"><span>口座</span><select name="account">${data.accounts.map(a => `<option value="${esc(a.id)}"${a.id === (fc.account || (fc.method === '現金' ? WALLET_ID : defaultBankId(data))) ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
       <div class="field-row">
         <label class="field"><span>開始月</span><input type="month" name="startMonth" value="${esc(fc.startMonth)}" required></label>
         <label class="field"><span>終了月（任意）</span><input type="month" name="endMonth" value="${esc(fc.endMonth || '')}"></label>
@@ -181,6 +199,8 @@ function editFixedCost(id, onDone) {
       sheet.querySelectorAll('[data-type]').forEach(b => b.classList.toggle('active', b.dataset.type === type));
       sheet.querySelector('#method-fields').hidden = type !== 'expense';
       sheet.querySelector('#card-field').hidden = form.method.value !== CARD_METHOD;
+      // カード払いはカードの引落口座、現金は財布に決まるので、口座を選ぶのはそれ以外のとき
+      sheet.querySelector('#bank-field').hidden = type === 'expense' && (form.method.value === CARD_METHOD || form.method.value === '現金');
     };
 
     sheet.querySelectorAll('[data-type]').forEach(b => b.addEventListener('click', () => {
@@ -207,6 +227,9 @@ function editFixedCost(id, onDone) {
         category: v.category,
         method: v.type === 'expense' ? v.method : '',
         card: v.type === 'expense' && v.method === CARD_METHOD ? v.card : '',
+        account: v.type === 'income' ? v.account
+          : v.method === '現金' ? WALLET_ID
+          : v.method === CARD_METHOD ? '' : v.account,
         day: Math.min(31, Math.max(1, Number(v.day) || 1)),
         startMonth: v.startMonth,
         endMonth: v.endMonth || '',
@@ -245,13 +268,78 @@ function editFixedCost(id, onDone) {
 }
 
 // -------------------------
+// 財布・銀行
+// 財布は1つだけ（名前だけ変えられる）。銀行はいくつでも追加できる
+// -------------------------
+
+function editAccount(id, onDone) {
+  const data = getData();
+  const existing = data.accounts.find(a => a.id === id);
+  const account = existing || { name: '', kind: 'bank' };
+
+  // 取引やカードで使われている口座は削除できない（残高の計算が合わなくなるため）
+  const inUse = existing && (
+    data.transactions.some(tx => tx.account === id || tx.fromAccount === id || tx.toAccount === id) ||
+    data.cards.some(c => c.accountId === id) ||
+    data.fixedCosts.some(fc => fc.account === id)
+  );
+  const canDelete = existing && existing.kind === 'bank' && bankAccounts(data).length > 1;
+
+  const body = `
+    <form id="account-form">
+      <label class="field"><span>名前</span><input type="text" name="name" value="${esc(account.name)}" placeholder="例：楽天銀行" required></label>
+      ${existing ? '' : `<label class="field"><span>今の残高（円）</span><input type="text" name="amount" inputmode="numeric" pattern="[0-9]*" value="0"></label>`}
+      ${canDelete && inUse ? '<p class="note" style="margin:0">この口座を使った記録があるため、削除できません。</p>' : ''}
+      <div class="btn-row">
+        ${canDelete && !inUse ? '<button type="button" class="btn danger" data-delete>削除</button>' : ''}
+        <button type="submit" class="btn primary">保存</button>
+      </div>
+    </form>`;
+
+  openSheet(existing ? `${account.name}を編集` : '銀行を追加', body, (sheet, close) => {
+    const form = sheet.querySelector('#account-form');
+
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const v = formData(form);
+      update(d => {
+        if (existing) {
+          d.accounts.find(a => a.id === id).name = v.name.trim();
+        } else {
+          d.accounts.push({
+            id: uid(),
+            name: v.name.trim(),
+            kind: 'bank',
+            baseAmount: Number(String(v.amount).replace(/[^0-9]/g, '')) || 0,
+            baseDate: todayStr(),
+            baseAt: Date.now()
+          });
+        }
+      });
+      close();
+      toast('保存しました');
+      onDone();
+    });
+
+    sheet.querySelector('[data-delete]')?.addEventListener('click', () => {
+      if (!confirm(`${account.name}を削除しますか？`)) return;
+      update(d => { d.accounts = d.accounts.filter(a => a.id !== id); });
+      close();
+      toast('削除しました');
+      onDone();
+    });
+  });
+}
+
+// -------------------------
 // クレジットカード
 // -------------------------
 
 function editCard(id, onDone) {
   const data = getData();
   const existing = data.cards.find(c => c.id === id);
-  const card = existing || { name: '', closingDay: 31, paymentDay: 26 };
+  const card = existing || { name: '', closingDay: 31, paymentDay: 26, accountId: defaultBankId(data) };
+  const banks = bankAccounts(data);
 
   const body = `
     <form id="card-form">
@@ -260,7 +348,10 @@ function editCard(id, onDone) {
         <label class="field"><span>締め日（31＝月末）</span><input type="number" name="closingDay" min="1" max="31" value="${card.closingDay}" required></label>
         <label class="field"><span>翌月の引落日</span><input type="number" name="paymentDay" min="1" max="31" value="${card.paymentDay}" required></label>
       </div>
-      <p class="note" style="margin:0">締め日までの利用は翌月、締め日より後の利用は翌々月に引き落とされる計算です。引落日を過ぎると、現金・預金から自動で差し引きます。</p>
+      <label class="field"><span>引き落とす口座</span>
+        <select name="accountId">${banks.map(a => `<option value="${esc(a.id)}"${a.id === (card.accountId || defaultBankId(data)) ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
+      </label>
+      <p class="note" style="margin:0">締め日までの利用は翌月、締め日より後の利用は翌々月に引き落とされる計算です。引落日を過ぎると、選んだ口座の残高から自動で差し引きます。</p>
       <div class="btn-row">
         ${existing ? '<button type="button" class="btn danger" data-delete>削除</button>' : ''}
         <button type="submit" class="btn primary">保存</button>
@@ -277,7 +368,8 @@ function editCard(id, onDone) {
         id: existing?.id || uid(),
         name: v.name.trim(),
         closingDay: Math.min(31, Math.max(1, Number(v.closingDay) || 31)),
-        paymentDay: Math.min(31, Math.max(1, Number(v.paymentDay) || 26))
+        paymentDay: Math.min(31, Math.max(1, Number(v.paymentDay) || 26)),
+        accountId: v.accountId || defaultBankId(getData())
       };
       const today = todayStr();
 
@@ -491,7 +583,8 @@ export function importCardStatement(buffer, onDone) {
             card: cardName,
             memo: row.memo,
             merchant: row.merchant,
-            importKey: row.importKey
+            importKey: row.importKey,
+            createdAt: Date.now()
           };
           applyDueDate(tx, d.cards);
           // 明細に引落月が書いてあれば、そちらを使う

@@ -3,7 +3,7 @@
 // すべてのデータを1つの JSON にまとめて localStorage に保存する
 // -------------------------
 
-import { todayStr, addMonths, INVEST_CATEGORY } from './calc.js';
+import { todayStr, addMonths, INVEST_CATEGORY, WALLET_ID } from './calc.js';
 
 export { INVEST_CATEGORY };
 
@@ -68,16 +68,25 @@ export function defaultGradPlan() {
   };
 }
 
+// お金がある場所（財布と銀行）。残高は baseDate の終わり時点の金額
+function defaultAccounts(baseAmount = 0, baseDate = todayStr()) {
+  return [
+    { id: WALLET_ID, name: '財布', kind: 'cash', baseAmount: 0, baseDate },
+    { id: uid(), name: 'ゆうちょ銀行', kind: 'bank', baseAmount, baseDate }
+  ];
+}
+
 function defaultData() {
+  const accounts = defaultAccounts();
   return {
     version: DATA_VERSION,
     transactions: [],
+    accounts,
     cards: [
-      { id: uid(), name: '三井住友カード', closingDay: 31, paymentDay: 26 }
+      { id: uid(), name: '三井住友カード', closingDay: 31, paymentDay: 26, accountId: accounts[1].id }
     ],
     fixedCosts: [],
     fixedGenerated: [],
-    cash: { baseAmount: 0, baseDate: todayStr() },
     investments: [],
     pointPrograms: [
       { id: uid(), name: 'Vポイント', yenPerPoint: 1, initial: 0 },
@@ -94,7 +103,10 @@ function defaultData() {
     settings: {
       lastBackup: null,
       lastMethod: '現金',
-      lastCard: ''
+      lastCard: '',
+      lastBank: '',
+      // 財布と銀行の残高を、利用者に合わせてもらう必要があるとき true
+      needsAccountSetup: false
     }
   };
 }
@@ -103,10 +115,21 @@ function defaultData() {
 function withDefaults(raw) {
   const base = defaultData();
   const merged = { ...base, ...raw };
-  merged.cash = { ...base.cash, ...(raw.cash || {}) };
+
   merged.categories = { ...base.categories, ...(raw.categories || {}) };
   merged.settings = { ...base.settings, ...(raw.settings || {}) };
   merged.gradPlan = { ...base.gradPlan, ...(raw.gradPlan || {}) };
+
+  // 以前の「現金・預金」1つだけのデータは、財布と銀行に分ける
+  // 今までの残高は銀行に入れ、あとで両方の残高を合わせてもらう
+  if (!Array.isArray(raw.accounts)) {
+    const cash = raw.cash || {};
+    merged.accounts = defaultAccounts(Number(cash.baseAmount) || 0, cash.baseDate || todayStr());
+    merged.settings.needsAccountSetup = true;
+    const bankId = merged.accounts[1].id;
+    merged.cards = (merged.cards || []).map(card => ({ accountId: bankId, ...card }));
+  }
+  delete merged.cash;
   return merged;
 }
 

@@ -731,3 +731,12 @@ details.card[open] summary { margin-bottom: 12px; }
 /* 「その他」の内容の入力欄 */
 #detail-row input { background: var(--surface); }
 .import-row .detail-input { display: block; margin-top: 6px; min-height: 36px; padding: 6px 10px; background: var(--surface); }
+
+/* チップの列の先頭に付ける見出し（「出金元」など） */
+.chip-label {
+  align-self: center;
+  flex-shrink: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  padding-right: 2px;
+}

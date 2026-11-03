@@ -6,7 +6,7 @@
 import { getData, update, uid } from '../store.js';
 import {
   todayStr, yen, signedYen, formatDate, formatFullDate, formatMonth,
-  assetSummary, investmentTotals, pointBalances, unpaidCardBills, snapshotAssets
+  assetSummary, investmentTotals, pointBalances, unpaidCardBills, snapshotAssets, accountBalances
 } from '../calc.js';
 import { esc, options, formData, openSheet, toast, drawChart, cssVar, shortYen } from '../ui.js';
 import { decodeCsv } from '../cardImport.js';
@@ -25,6 +25,7 @@ export function render(root) {
   const inv = investmentTotals(data);
   const points = pointBalances(data);
   const bills = unpaidCardBills(data, today);
+  const balances = accountBalances(data, today);
   const gainRate = inv.principal ? (inv.gain / inv.principal) * 100 : 0;
 
   root.innerHTML = `
@@ -43,17 +44,25 @@ export function render(root) {
         <div class="stat"><div class="label">ポイント</div><div class="value">${yen(s.points)}</div></div>
       </div>
 
-      <h3 class="section-title"><span>現金・預金</span></h3>
+      ${data.settings.needsAccountSetup ? `
+        <div class="callout warn" style="margin-top:12px">
+          <div class="label">👛 財布と銀行を分けて管理できるようになりました</div>
+          <p>今の財布と銀行の残高を入れてください。今までの残高は、いったん銀行に入れてあります。</p>
+          <button type="button" class="btn primary block" style="margin-top:10px" data-setup-accounts>残高を入れる</button>
+        </div>` : ''}
+
+      <h3 class="section-title"><span>現金・預金</span><span class="num">${yen(s.cash)}</span></h3>
       <div class="list">
-        <button type="button" class="list-row" data-cash>
-          <div class="main">
-            <div class="title">今の残高</div>
-            <div class="sub">${formatFullDate(data.cash.baseDate)}の残高 ${yen(data.cash.baseAmount)} から、記録した収支で計算</div>
-          </div>
-          <div class="amount">${yen(s.cash)}</div>
-        </button>
+        ${balances.map(({ account, balance }) => `
+          <button type="button" class="list-row" data-account="${esc(account.id)}">
+            <div class="main">
+              <div class="title">${account.kind === 'cash' ? '👛' : '🏦'} ${esc(account.name)}</div>
+              <div class="sub">${formatFullDate(account.baseDate)}の残高 ${yen(account.baseAmount)} から計算</div>
+            </div>
+            <div class="amount ${balance < 0 ? 'expense' : ''}">${yen(balance)}</div>
+          </button>`).join('')}
       </div>
-      <p class="note">通帳やお財布の金額とずれてきたら、タップして合わせてください。</p>
+      <p class="note">財布や通帳の金額とずれてきたら、タップして合わせてください。ATM で引き出したときは「入力」の「移動」で記録します。銀行の追加は設定から。</p>
 
       ${bills.length ? `
         <h3 class="section-title"><span>カードの引落予定</span></h3>
@@ -129,7 +138,8 @@ export function render(root) {
     if (!button) return;
     const ds = button.dataset;
 
-    if ('cash' in ds) editCash(rerender);
+    if (ds.account) editAccountBalance(ds.account, rerender);
+    else if ('setupAccounts' in ds) setupAccounts(rerender);
     else if ('addInvestment' in ds) editInvestment(null, rerender);
     else if (ds.investment) editInvestment(ds.investment, rerender);
     else if ('addProgram' in ds) editProgram(null, rerender);
@@ -187,25 +197,65 @@ function drawAssetChart(canvas, history) {
 // 現金・預金の残高合わせ
 // -------------------------
 
-function editCash(onDone) {
+function editAccountBalance(id, onDone) {
   const data = getData();
   const today = todayStr();
-  const current = Math.round(assetSummary(data, today).cash);
+  const account = data.accounts.find(a => a.id === id);
+  const current = Math.round(accountBalances(data, today).find(b => b.account.id === id).balance);
 
   const body = `
     <form id="cash-form">
-      <p class="note" style="margin:0 0 12px">銀行口座とお財布の合計を入れてください。この日より後の収入・支出は、記録した内容で自動的に増減します。</p>
+      <p class="note" style="margin:0 0 12px">${account.kind === 'cash' ? '財布に入っている現金' : '通帳やアプリに表示されている残高'}を入れてください。この日より後の出入りは、記録した内容で自動的に増減します。</p>
       <label class="field"><span>残高（円）</span><input type="text" name="amount" inputmode="numeric" pattern="[0-9]*" value="${current}" required></label>
       <label class="field"><span>この日の終わり時点の残高</span><input type="date" name="date" value="${today}" required></label>
-      <p class="note" style="margin:0">今日の記録がすべて入っているなら今日のまま、まだ入れていない記録があるなら昨日の日付にします。</p>
+      <p class="note" style="margin:0">ふつうは今日のままで大丈夫です。この後に記録した出入りは、自動で残高に反映されます。</p>
       <div class="btn-row"><button type="submit" class="btn primary">保存</button></div>
     </form>`;
 
-  openSheet('現金・預金の残高', body, (sheet, close) => {
-    sheet.querySelector('#cash-form').addEventListener('submit', e => {
+  openSheet(`${account.name}の残高`, body, (sheet, close) => {
+    const form = sheet.querySelector('#cash-form');
+    form.amount.select();
+    form.addEventListener('submit', e => {
       e.preventDefault();
-      const v = formData(e.target);
-      update(d => { d.cash = { baseAmount: parseYen(v.amount), baseDate: v.date }; });
+      const v = formData(form);
+      update(d => {
+        Object.assign(d.accounts.find(a => a.id === id), { baseAmount: parseYen(v.amount), baseDate: v.date, baseAt: Date.now() });
+      });
+      close();
+      toast('残高を保存しました');
+      onDone();
+    });
+  });
+}
+
+// 財布と銀行に分けたあと、最初に全部の残高をまとめて入れてもらう
+function setupAccounts(onDone) {
+  const data = getData();
+  const today = todayStr();
+  const balances = accountBalances(data, today);
+
+  const body = `
+    <form id="setup-form">
+      <p class="note" style="margin:0 0 12px">今の残高を入れてください。この後に記録した出入りは、自動で残高に反映されます。</p>
+      ${balances.map(({ account, balance }) => `
+        <label class="field"><span>${account.kind === 'cash' ? '👛' : '🏦'} ${esc(account.name)}（円）</span>
+          <input type="text" name="${esc(account.id)}" inputmode="numeric" pattern="[0-9]*" value="${Math.max(0, Math.round(balance))}" required>
+        </label>`).join('')}
+      <p class="note" style="margin:0">銀行がほかにもあるときは、先に「設定 → 財布・銀行」で追加してください。</p>
+      <div class="btn-row"><button type="submit" class="btn primary">保存</button></div>
+    </form>`;
+
+  openSheet('財布と銀行の残高', body, (sheet, close) => {
+    const form = sheet.querySelector('#setup-form');
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const v = formData(form);
+      update(d => {
+        for (const account of d.accounts) {
+          if (account.id in v) Object.assign(account, { baseAmount: parseYen(v[account.id]), baseDate: today, baseAt: Date.now() });
+        }
+        d.settings.needsAccountSetup = false;
+      });
       close();
       toast('残高を保存しました');
       onDone();

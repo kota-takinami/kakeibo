@@ -6,7 +6,8 @@
 import { getData, update, METHODS } from '../store.js';
 import {
   todayStr, monthOf, addMonths, yen, signedYen, formatMonth, formatDate,
-  monthSummary, applyDueDate, isCardPaid, categoryLabel, recentDetails, CARD_METHOD, OTHER_CATEGORY
+  monthSummary, applyDueDate, isCardPaid, categoryLabel, recentDetails, accountOf, bankAccounts,
+  CARD_METHOD, CASH_METHOD, OTHER_CATEGORY, WALLET_ID
 } from '../calc.js';
 import { esc, options, formData, openSheet, toast } from '../ui.js';
 
@@ -64,7 +65,8 @@ export function render(root) {
       <div class="list">
         ${entries.length === 0 ? '<div class="empty">記録がありません</div>' : [...byDate.entries()].map(([date, list]) => `
           <div class="date-heading"><span>${formatDate(date)}</span></div>
-          ${list.map(entry => entry.kind === 'tx' ? txRow(entry.item, today) : pointRow(entry.item, data)).join('')}
+          ${list.map(entry => entry.kind === 'point' ? pointRow(entry.item, data)
+            : entry.item.type === 'transfer' ? transferRow(entry.item, data) : txRow(entry.item, today, data)).join('')}
         `).join('')}
       </div>
       <p class="note">タップすると修正・削除できます。</p>
@@ -80,19 +82,44 @@ export function render(root) {
       render(root);
     } else if (button.dataset.tx) {
       editTransaction(button.dataset.tx, () => render(root));
+    } else if (button.dataset.transfer) {
+      editTransfer(button.dataset.transfer, () => render(root));
     } else if (button.dataset.point) {
       editPoint(button.dataset.point, () => render(root));
     }
   });
 }
 
-function txRow(tx, today) {
+const accountName = (data, id) => data.accounts.find(a => a.id === id)?.name || '削除した口座';
+
+function transferRow(tx, data) {
+  return `
+    <button type="button" class="list-row" data-transfer="${esc(tx.id)}">
+      <div class="main">
+        <div class="title">🔁 ${esc(accountName(data, tx.fromAccount))} → ${esc(accountName(data, tx.toAccount))}</div>
+        ${tx.memo ? `<div class="sub">${esc(tx.memo)}</div>` : ''}
+      </div>
+      <div class="amount muted">${yen(tx.amount)}</div>
+    </button>`;
+}
+
+function txRow(tx, today, data) {
   const badges = [];
   if (tx.fixedId) badges.push('<span class="badge">固定費</span>');
   if (tx.method === CARD_METHOD) {
     badges.push(`<span class="badge">${isCardPaid(tx, today) ? '引落済' : `${formatDate(tx.dueDate)}引落`}</span>`);
   }
-  const sub = [tx.type === 'expense' ? (tx.card || tx.method) : '', tx.memo].filter(Boolean).join(' ・ ');
+  // 支払方法（銀行が2つ以上あるときは、どの銀行かも）
+  let where = '';
+  if (tx.type === 'expense') {
+    where = tx.card || tx.method;
+    if (tx.method !== CARD_METHOD && tx.method !== CASH_METHOD && bankAccounts(data).length > 1) {
+      where += `（${accountName(data, accountOf(tx, data))}）`;
+    }
+  } else if (tx.type === 'income') {
+    where = `入金先：${accountName(data, accountOf(tx, data))}`;
+  }
+  const sub = [where, tx.memo].filter(Boolean).join(' ・ ');
 
   return `
     <button type="button" class="list-row" data-tx="${esc(tx.id)}">
@@ -119,6 +146,71 @@ function pointRow(record, data) {
 // -------------------------
 // 取引の修正・削除
 // -------------------------
+
+// -------------------------
+// 口座間の移動の修正・削除
+// -------------------------
+
+function editTransfer(id, onDone) {
+  const data = getData();
+  const tx = data.transactions.find(t => t.id === id);
+  if (!tx) return;
+
+  const accountOptions = selected => data.accounts
+    .map(a => `<option value="${esc(a.id)}"${a.id === selected ? ' selected' : ''}>${esc(a.name)}</option>`)
+    .join('');
+
+  const body = `
+    <form id="transfer-form">
+      <div class="field-row">
+        <label class="field"><span>出金元</span><select name="fromAccount">${accountOptions(tx.fromAccount)}</select></label>
+        <label class="field"><span>入金先</span><select name="toAccount">${accountOptions(tx.toAccount)}</select></label>
+      </div>
+      <div class="field-row">
+        <label class="field"><span>日付</span><input type="date" name="date" value="${esc(tx.date)}" required></label>
+        <label class="field"><span>金額（円）</span><input type="text" name="amount" inputmode="numeric" pattern="[0-9]*" value="${tx.amount}" required></label>
+      </div>
+      <label class="field"><span>メモ</span><input type="text" name="memo" value="${esc(tx.memo)}"></label>
+      <div class="btn-row">
+        <button type="button" class="btn danger" data-delete>削除</button>
+        <button type="submit" class="btn primary">保存</button>
+      </div>
+    </form>`;
+
+  openSheet('移動を修正', body, (sheet, close) => {
+    const form = sheet.querySelector('#transfer-form');
+
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const values = formData(form);
+      const amount = Number(String(values.amount).replace(/[^0-9]/g, ''));
+      if (!amount || values.fromAccount === values.toAccount) {
+        toast(amount ? '出金元と入金先を別の場所にしてください' : '金額を入力してください');
+        return;
+      }
+      update(d => {
+        Object.assign(d.transactions.find(t => t.id === id), {
+          fromAccount: values.fromAccount,
+          toAccount: values.toAccount,
+          date: values.date,
+          amount,
+          memo: values.memo.trim()
+        });
+      });
+      close();
+      toast('修正しました');
+      onDone();
+    });
+
+    sheet.querySelector('[data-delete]').addEventListener('click', () => {
+      if (!confirm('この移動を削除しますか？')) return;
+      update(d => { d.transactions = d.transactions.filter(t => t.id !== id); });
+      close();
+      toast('削除しました');
+      onDone();
+    });
+  });
+}
 
 function editTransaction(id, onDone) {
   const data = getData();
@@ -155,6 +247,9 @@ function editTransaction(id, onDone) {
         <label class="field"><span>支払方法</span><select name="method">${options(METHODS, tx.method)}</select></label>
         <label class="field" id="card-field"><span>カード</span><select name="card">${options(data.cards.map(c => c.name), tx.card)}</select></label>
       </div>
+      <label class="field" id="account-field"><span id="account-label">口座</span>
+        <select name="account">${data.accounts.map(a => `<option value="${esc(a.id)}"${a.id === accountOf(tx, data) ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
+      </label>
       <label class="field"><span>メモ</span><input type="text" name="memo" value="${esc(tx.memo)}"></label>
       <div class="btn-row">
         <button type="button" class="btn danger" data-delete>削除</button>
@@ -170,6 +265,10 @@ function editTransaction(id, onDone) {
       sheet.querySelector('#method-fields').hidden = type !== 'expense';
       sheet.querySelector('#card-field').hidden = form.method.value !== CARD_METHOD;
       sheet.querySelector('#detail-field').hidden = form.category.value !== OTHER_CATEGORY;
+      // 現金なら財布、カードならカードの引落口座に決まるので、選ぶのはそれ以外のとき
+      const method = form.method.value;
+      sheet.querySelector('#account-field').hidden = type === 'expense' && (method === CARD_METHOD || method === CASH_METHOD);
+      sheet.querySelector('#account-label').textContent = type === 'income' ? '入金先' : '引き落とす口座';
     };
     form.type.addEventListener('change', () => {
       form.category.innerHTML = categoryOptions(form.type.value);
@@ -197,6 +296,9 @@ function editTransaction(id, onDone) {
           detail: values.category === OTHER_CATEGORY ? values.detail.trim() : '',
           method: values.type === 'expense' ? values.method : '',
           card: values.type === 'expense' && values.method === CARD_METHOD ? values.card : '',
+          account: values.type === 'income' ? values.account
+            : values.method === CASH_METHOD ? WALLET_ID
+            : values.method === CARD_METHOD ? '' : values.account,
           memo: values.memo.trim()
         });
         applyDueDate(target, d.cards);

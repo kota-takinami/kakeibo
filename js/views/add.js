@@ -1,11 +1,13 @@
 // -------------------------
 // 入力画面（アプリを開いたら最初に出る画面）
 // 金額 → カテゴリ → 支払方法 を選んで保存するだけで記録できる
+// 「移動」は ATM での引き出しなど、銀行と財布の間でお金を動かしたときに使う
 // -------------------------
 
 import { getData, update, uid, METHODS } from '../store.js';
 import {
-  todayStr, addMonths, monthOf, yen, applyDueDate, categoryLabel, recentDetails, CARD_METHOD, OTHER_CATEGORY
+  todayStr, addMonths, monthOf, yen, applyDueDate, categoryLabel, recentDetails, bankAccounts, defaultBankId,
+  CARD_METHOD, CASH_METHOD, OTHER_CATEGORY, WALLET_ID
 } from '../calc.js';
 import { esc, toast } from '../ui.js';
 
@@ -13,11 +15,15 @@ const MAX_DIGITS = 8;
 
 // 画面を切り替えても入力途中の状態を覚えておく
 const state = {
-  mode: 'expense',      // 'expense' | 'income' | 'point'
+  mode: 'expense',      // 'expense' | 'income' | 'transfer' | 'point'
   amount: '',
   category: null,
   method: null,
   card: null,
+  bank: null,           // 口座振替・QR決済などで使う銀行（銀行が2つ以上あるとき選ぶ）
+  incomeAccount: null,  // 収入が入る口座
+  from: null,           // 移動：出金元
+  to: null,             // 移動：入金先
   date: todayStr(),
   dateChosen: false,
   memo: '',
@@ -39,11 +45,15 @@ function sortedCategories(type) {
   return [...data.categories[type]].sort((a, b) => (counts.get(b) || 0) - (counts.get(a) || 0));
 }
 
-function chipsHtml(values, selected, attr) {
-  return values
+function chipsHtml(values, selected, attr, label = '') {
+  const head = label ? `<span class="chip-label">${esc(label)}</span>` : '';
+  return head + values
     .map(v => `<button type="button" class="chip${v.value === selected ? ' active' : ''}" data-${attr}="${esc(v.value)}">${esc(v.label)}</button>`)
     .join('');
 }
+
+// 財布・銀行のチップ用
+const accountChips = data => data.accounts.map(a => ({ value: a.id, label: a.kind === 'cash' ? `👛 ${a.name}` : `🏦 ${a.name}` }));
 
 export function render(root) {
   const data = getData();
@@ -54,6 +64,11 @@ export function render(root) {
   // 前回の選択を初期値にする
   if (!state.method) state.method = data.settings.lastMethod || '現金';
   if (!state.card) state.card = data.settings.lastCard || data.cards[0]?.name || '';
+  const hasAccount = id => data.accounts.some(a => a.id === id);
+  if (!hasAccount(state.bank)) state.bank = hasAccount(data.settings.lastBank) ? data.settings.lastBank : defaultBankId(data);
+  if (!hasAccount(state.incomeAccount)) state.incomeAccount = defaultBankId(data);
+  if (!hasAccount(state.from)) state.from = defaultBankId(data);
+  if (!hasAccount(state.to)) state.to = WALLET_ID;
   if (!state.programId || !data.pointPrograms.some(p => p.id === state.programId)) {
     state.programId = data.pointPrograms[0]?.id || null;
   }
@@ -63,6 +78,7 @@ export function render(root) {
       <div class="seg" role="tablist" aria-label="記録の種類">
         <button type="button" data-mode="expense">支出</button>
         <button type="button" data-mode="income">収入</button>
+        <button type="button" data-mode="transfer">移動</button>
         <button type="button" data-mode="point">ポイント</button>
       </div>
 
@@ -119,8 +135,9 @@ export function render(root) {
         <span class="sub">${yen(yenValue)}相当</span>
         <span class="value num">${value.toLocaleString('ja-JP')}<small style="font-size:20px"> pt</small></span>`;
     } else {
+      const label = { expense: '支出', income: '収入', transfer: '移動' }[state.mode];
       display.innerHTML = `
-        <span class="label">${state.mode === 'expense' ? '支出' : '収入'}</span>
+        <span class="label">${label}</span>
         <span class="value num">${yen(value)}</span>`;
     }
     $('#save-button').disabled = value <= 0;
@@ -134,6 +151,17 @@ export function render(root) {
     const primary = $('#primary-chips');
     const secondary = $('#secondary-chips');
     const cards = $('#card-chips');
+    primary.classList.toggle('two-rows', state.mode !== 'transfer');
+    primary.classList.toggle('scroll', state.mode === 'transfer');
+
+    if (state.mode === 'transfer') {
+      primary.innerHTML = chipsHtml(accountChips(data), state.from, 'from', '出金元');
+      secondary.innerHTML = chipsHtml(accountChips(data), state.to, 'to', '入金先');
+      cards.innerHTML = '';
+      $('#detail-row').hidden = true;
+      $('#memo').placeholder = 'メモ（例：ATMで引き出し）';
+      return;
+    }
 
     if (state.mode === 'point') {
       primary.innerHTML = chipsHtml(
@@ -152,11 +180,17 @@ export function render(root) {
 
     if (state.mode === 'expense') {
       secondary.innerHTML = chipsHtml(METHODS.map(m => ({ value: m, label: m })), state.method, 'method');
-      cards.innerHTML = state.method === CARD_METHOD && data.cards.length > 1
-        ? chipsHtml(data.cards.map(c => ({ value: c.name, label: `💳 ${c.name}` })), state.card, 'card')
-        : '';
+      // カードが2枚以上ならカードを、口座振替などで銀行が2つ以上なら銀行を選ぶ
+      const banks = bankAccounts(data);
+      if (state.method === CARD_METHOD && data.cards.length > 1) {
+        cards.innerHTML = chipsHtml(data.cards.map(c => ({ value: c.name, label: `💳 ${c.name}` })), state.card, 'card');
+      } else if (state.method !== CARD_METHOD && state.method !== CASH_METHOD && banks.length > 1) {
+        cards.innerHTML = chipsHtml(banks.map(a => ({ value: a.id, label: `🏦 ${a.name}` })), state.bank, 'bank');
+      } else {
+        cards.innerHTML = '';
+      }
     } else {
-      secondary.innerHTML = '';
+      secondary.innerHTML = chipsHtml(accountChips(data), state.incomeAccount, 'account', '入金先');
       cards.innerHTML = '';
     }
 
@@ -216,7 +250,25 @@ export function render(root) {
         label: '取り消し',
         run: () => update(d => { d.pointRecords = d.pointRecords.filter(r => r.id !== record.id); })
       });
+    } else if (state.mode === 'transfer') {
+      if (state.from === state.to) {
+        toast('出金元と入金先を別の場所にしてください');
+        return;
+      }
+      const name = id => data.accounts.find(a => a.id === id)?.name || '';
+      const tx = { id: uid(), date, type: 'transfer', amount, fromAccount: state.from, toAccount: state.to, memo: state.memo, createdAt: Date.now() };
+      update(d => d.transactions.push(tx));
+      toast(`${name(tx.fromAccount)} → ${name(tx.toAccount)} ${yen(amount)}`, {
+        label: '取り消し',
+        run: () => update(d => { d.transactions = d.transactions.filter(t => t.id !== tx.id); })
+      });
     } else {
+      // お金が出入りする口座（現金なら財布、カードならカードの引落口座）
+      let account = '';
+      if (state.mode === 'income') account = state.incomeAccount;
+      else if (state.method === CASH_METHOD) account = WALLET_ID;
+      else if (state.method !== CARD_METHOD) account = state.bank;
+
       const tx = {
         id: uid(),
         date,
@@ -225,14 +277,17 @@ export function render(root) {
         category: state.category,
         method: state.mode === 'expense' ? state.method : '',
         card: state.mode === 'expense' && state.method === CARD_METHOD ? state.card : '',
+        account,
         detail: state.category === OTHER_CATEGORY ? $('#detail').value.trim() : '',
-        memo: state.memo
+        memo: state.memo,
+        createdAt: Date.now()
       };
       update(d => {
         d.transactions.push(applyDueDate(tx, d.cards));
         if (tx.type === 'expense') {
           d.settings.lastMethod = tx.method;
           if (tx.card) d.settings.lastCard = tx.card;
+          if (account && account !== WALLET_ID) d.settings.lastBank = account;
         }
       });
       toast(`${categoryLabel(tx)} ${yen(amount)} を保存しました`, {
@@ -248,7 +303,7 @@ export function render(root) {
     $('#memo').value = '';
     $('#detail').value = '';
     // いま入れた内容も、次から候補に出るようにする
-    if (state.mode !== 'point') {
+    if (state.mode === 'expense' || state.mode === 'income') {
       $('#detail-options').innerHTML = recentDetails(data, state.mode)
         .map(v => `<option value="${esc(v)}">`).join('');
     }
@@ -275,6 +330,18 @@ export function render(root) {
       refreshChips();
     } else if (ds.card) {
       state.card = ds.card;
+      refreshChips();
+    } else if (ds.bank) {
+      state.bank = ds.bank;
+      refreshChips();
+    } else if (ds.account) {
+      state.incomeAccount = ds.account;
+      refreshChips();
+    } else if (ds.from) {
+      state.from = ds.from;
+      refreshChips();
+    } else if (ds.to) {
+      state.to = ds.to;
       refreshChips();
     } else if (ds.program) {
       state.programId = ds.program;
