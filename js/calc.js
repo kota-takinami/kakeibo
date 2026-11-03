@@ -5,6 +5,22 @@
 
 export const CARD_METHOD = 'クレジットカード';
 export const INVEST_CATEGORY = '投資・積立';
+// このカテゴリを選んだときだけ、内容（detail）を入力できる
+export const OTHER_CATEGORY = 'その他';
+
+// 「その他（美容院）」のように、内容があれば付けて表示する
+export function categoryLabel(tx) {
+  return tx.category === OTHER_CATEGORY && tx.detail ? `${tx.category}（${tx.detail}）` : tx.category;
+}
+
+// 「その他」の内容として最近使ったもの（新しい順、重複なし）
+export function recentDetails(data, type, limit = 12) {
+  const list = data.transactions
+    .filter(tx => tx.type === type && tx.detail)
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .map(tx => tx.detail);
+  return [...new Set(list)].slice(0, limit);
+}
 
 // -------------------------
 // 日付
@@ -225,7 +241,8 @@ export function monthSummary(data, ym) {
       invest += tx.amount;
     } else {
       expense += tx.amount;
-      byCategory.set(tx.category, (byCategory.get(tx.category) || 0) + tx.amount);
+      const label = categoryLabel(tx);
+      byCategory.set(label, (byCategory.get(label) || 0) + tx.amount);
     }
   }
 

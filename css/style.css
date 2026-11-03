@@ -727,3 +727,7 @@ details.card[open] summary { margin-bottom: 12px; }
 @media (prefers-reduced-motion: reduce) {
   .sheet, .sheet-backdrop, .toast { animation: none; transition: none; }
 }
+
+/* 「その他」の内容の入力欄 */
+#detail-row input { background: var(--surface); }
+.import-row .detail-input { display: block; margin-top: 6px; min-height: 36px; padding: 6px 10px; background: var(--surface); }

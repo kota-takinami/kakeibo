@@ -4,7 +4,9 @@
 // -------------------------
 
 import { getData, update, uid, METHODS } from '../store.js';
-import { todayStr, addMonths, monthOf, yen, applyDueDate, CARD_METHOD } from '../calc.js';
+import {
+  todayStr, addMonths, monthOf, yen, applyDueDate, categoryLabel, recentDetails, CARD_METHOD, OTHER_CATEGORY
+} from '../calc.js';
 import { esc, toast } from '../ui.js';
 
 const MAX_DIGITS = 8;
@@ -19,6 +21,7 @@ const state = {
   date: todayStr(),
   dateChosen: false,
   memo: '',
+  detail: '',           // カテゴリが「その他」のときの内容（例：美容院）
   programId: null,
   pointSign: 1          // 1: 獲得, -1: 使用
 };
@@ -68,6 +71,11 @@ export function render(root) {
       <div class="chips two-rows" id="primary-chips"></div>
       <div class="chips scroll" id="secondary-chips"></div>
       <div class="chips scroll" id="card-chips"></div>
+
+      <div id="detail-row" hidden>
+        <input type="text" id="detail" list="detail-options" placeholder="「その他」の内容（例：美容院）" aria-label="「その他」の内容" enterkeyhint="done">
+        <datalist id="detail-options"></datalist>
+      </div>
 
       <div class="inline-fields">
         <input type="date" id="date" aria-label="日付">
@@ -133,6 +141,7 @@ export function render(root) {
       secondary.innerHTML = chipsHtml(
         [{ value: '1', label: '＋ 獲得' }, { value: '-1', label: '− 使用' }], String(state.pointSign), 'sign');
       cards.innerHTML = '';
+      $('#detail-row').hidden = true;
       $('#memo').placeholder = 'メモ（例：コンビニで還元）';
       return;
     }
@@ -149,6 +158,15 @@ export function render(root) {
     } else {
       secondary.innerHTML = '';
       cards.innerHTML = '';
+    }
+
+    // 「その他」のときだけ、内容の入力欄を出す（前に使った内容が候補に出る）
+    const showDetail = state.category === OTHER_CATEGORY;
+    $('#detail-row').hidden = !showDetail;
+    if (showDetail) {
+      $('#detail-options').innerHTML = recentDetails(data, state.mode)
+        .map(v => `<option value="${esc(v)}">`).join('');
+      $('#detail').value = state.detail;
     }
     $('#memo').placeholder = 'メモ（任意）';
   }
@@ -207,6 +225,7 @@ export function render(root) {
         category: state.category,
         method: state.mode === 'expense' ? state.method : '',
         card: state.mode === 'expense' && state.method === CARD_METHOD ? state.card : '',
+        detail: state.category === OTHER_CATEGORY ? $('#detail').value.trim() : '',
         memo: state.memo
       };
       update(d => {
@@ -216,16 +235,23 @@ export function render(root) {
           if (tx.card) d.settings.lastCard = tx.card;
         }
       });
-      toast(`${tx.category} ${yen(amount)} を保存しました`, {
+      toast(`${categoryLabel(tx)} ${yen(amount)} を保存しました`, {
         label: '取り消し',
         run: () => update(d => { d.transactions = d.transactions.filter(t => t.id !== tx.id); })
       });
     }
 
-    // 続けて入力できるよう、金額とメモだけ消す（日付と選択は残す）
+    // 続けて入力できるよう、金額とメモと内容だけ消す（日付と選択は残す）
     state.amount = '';
     state.memo = '';
+    state.detail = '';
     $('#memo').value = '';
+    $('#detail').value = '';
+    // いま入れた内容も、次から候補に出るようにする
+    if (state.mode !== 'point') {
+      $('#detail-options').innerHTML = recentDetails(data, state.mode)
+        .map(v => `<option value="${esc(v)}">`).join('');
+    }
     refreshAmount();
   }
 
@@ -268,6 +294,10 @@ export function render(root) {
   });
 
   $('#memo').addEventListener('input', e => { state.memo = e.target.value; });
+  $('#detail').addEventListener('input', e => { state.detail = e.target.value; });
+  $('#detail').addEventListener('keydown', e => {
+    if (e.key === 'Enter') e.target.blur();
+  });
   $('#memo').addEventListener('keydown', e => {
     if (e.key === 'Enter') e.target.blur();
   });

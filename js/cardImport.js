@@ -13,7 +13,7 @@
 //   補足行： 利用日が空の行（海外利用の金額、ETC の区間など）は、直前の明細の補足
 // -------------------------
 
-import { CARD_METHOD } from './calc.js';
+import { CARD_METHOD, INVEST_CATEGORY } from './calc.js';
 
 // Shift_JIS と UTF-8 のどちらで保存されていても読めるようにする
 export function decodeCsv(buffer) {
@@ -65,7 +65,8 @@ const toDate = value => {
 
 const toAmount = value => Number(tidy(value || '').replace(/[,¥\\円]/g, ''));
 
-// 電子マネーへのチャージは「お金の移動」で、買い物そのものではない
+// 電子マネー（楽天キャッシュなど）へのチャージ
+// このユーザーは楽天キャッシュで投資しているので、最初は「投資・積立」として扱う
 const isCharge = name => /チヤジ|ペイ残高|ペイザンダカ/.test(matchKey(name));
 
 export function parseCardCsv(text) {
@@ -95,8 +96,9 @@ export function parseCardCsv(text) {
       memo: memoParts.join(''),
       merchant: merchantKey(r.name),
       importKey: `${base}|${count}`,
+      charge: isCharge(r.name),
       // 最初はチェックを外しておく理由（なければ null）
-      skipReason: r.carried ? 'carried' : isCharge(r.name) ? 'charge' : null
+      skipReason: r.carried ? 'carried' : null
     };
   });
 
@@ -199,11 +201,21 @@ export function guessCategory(row, data) {
     .sort((a, b) => b.date.localeCompare(a.date))[0];
   if (past) return past.category;
 
+  if (row.charge && categories.includes(INVEST_CATEGORY)) return INVEST_CATEGORY;
+
   const key = matchKey(row.name);
   for (const [category, words] of RULES) {
     if (categories.includes(category) && words.some(w => key.includes(w))) return category;
   }
   return categories.includes('その他') ? 'その他' : categories[0];
+}
+
+// 前に同じ店で「その他（○○）」と記録していれば、その○○を使う
+export function guessDetail(row, data) {
+  const past = data.transactions
+    .filter(tx => tx.merchant === row.merchant && tx.detail)
+    .sort((a, b) => b.date.localeCompare(a.date))[0];
+  return past ? past.detail : '';
 }
 
 // -------------------------

@@ -6,7 +6,7 @@
 import { getData, update, METHODS } from '../store.js';
 import {
   todayStr, monthOf, addMonths, yen, signedYen, formatMonth, formatDate,
-  monthSummary, applyDueDate, isCardPaid, CARD_METHOD
+  monthSummary, applyDueDate, isCardPaid, categoryLabel, recentDetails, CARD_METHOD, OTHER_CATEGORY
 } from '../calc.js';
 import { esc, options, formData, openSheet, toast } from '../ui.js';
 
@@ -97,7 +97,7 @@ function txRow(tx, today) {
   return `
     <button type="button" class="list-row" data-tx="${esc(tx.id)}">
       <div class="main">
-        <div class="title">${esc(tx.category)}${badges.join('')}</div>
+        <div class="title">${esc(categoryLabel(tx))}${badges.join('')}</div>
         ${sub ? `<div class="sub">${esc(sub)}</div>` : ''}
       </div>
       <div class="amount ${tx.type === 'income' ? 'income' : ''}">${tx.type === 'income' ? '+' : ''}${yen(tx.amount)}</div>
@@ -147,6 +147,10 @@ function editTransaction(id, onDone) {
         <input type="text" name="amount" inputmode="numeric" pattern="[0-9]*" value="${tx.amount}" required>
       </label>
       <label class="field"><span>カテゴリ</span><select name="category">${categoryOptions(tx.type)}</select></label>
+      <label class="field" id="detail-field"><span>「その他」の内容</span>
+        <input type="text" name="detail" value="${esc(tx.detail || '')}" list="edit-detail-options" placeholder="例：美容院">
+        <datalist id="edit-detail-options">${recentDetails(data, tx.type).map(v => `<option value="${esc(v)}">`).join('')}</datalist>
+      </label>
       <div class="field-row" id="method-fields">
         <label class="field"><span>支払方法</span><select name="method">${options(METHODS, tx.method)}</select></label>
         <label class="field" id="card-field"><span>カード</span><select name="card">${options(data.cards.map(c => c.name), tx.card)}</select></label>
@@ -165,12 +169,14 @@ function editTransaction(id, onDone) {
       const type = form.type.value;
       sheet.querySelector('#method-fields').hidden = type !== 'expense';
       sheet.querySelector('#card-field').hidden = form.method.value !== CARD_METHOD;
+      sheet.querySelector('#detail-field').hidden = form.category.value !== OTHER_CATEGORY;
     };
     form.type.addEventListener('change', () => {
       form.category.innerHTML = categoryOptions(form.type.value);
       refresh();
     });
     form.method.addEventListener('change', refresh);
+    form.category.addEventListener('change', refresh);
     refresh();
 
     form.addEventListener('submit', e => {
@@ -188,6 +194,7 @@ function editTransaction(id, onDone) {
           date: values.date,
           amount,
           category: values.category,
+          detail: values.category === OTHER_CATEGORY ? values.detail.trim() : '',
           method: values.type === 'expense' ? values.method : '',
           card: values.type === 'expense' && values.method === CARD_METHOD ? values.card : '',
           memo: values.memo.trim()
