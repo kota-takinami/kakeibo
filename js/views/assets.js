@@ -6,11 +6,13 @@
 import { getData, update, uid } from '../store.js';
 import {
   todayStr, yen, signedYen, formatDate, formatFullDate, formatMonth,
-  assetSummary, investmentTotals, pointBalances, unpaidCardBills, snapshotAssets, accountBalances
+  assetSummary, investmentTotals, pointBalances, unpaidCardBills, snapshotAssets, accountBalances,
+  accountOf, bankAccounts, defaultBankId, WALLET_ID
 } from '../calc.js';
 import { esc, options, formData, openSheet, toast, drawChart, cssVar, shortYen } from '../ui.js';
 import { decodeCsv } from '../cardImport.js';
 import { parseHoldingsCsv, planHoldingsImport, BROKER, DEPOSIT_NAME } from '../brokerImport.js';
+import { parseBankCsv, applyPastChoices, markBankDuplicates } from '../bankImport.js';
 
 const INVESTMENT_KINDS = ['投資信託', '日本株', '米国株', 'ETF', '債券', 'その他'];
 
@@ -63,6 +65,11 @@ export function render(root) {
           </button>`).join('')}
       </div>
       <p class="note">財布や通帳の金額とずれてきたら、タップして合わせてください。ATM で引き出したときは「入力」の「移動」で記録します。銀行の追加は設定から。</p>
+      <label class="btn block" style="margin-top:10px">
+        📄 銀行の入出金明細（CSV）を取り込む
+        <input type="file" accept=".csv,text/csv" data-bank-csv hidden>
+      </label>
+      <p class="note">ゆうちょダイレクトの「入出金明細」の CSV に対応しています。</p>
 
       ${bills.length ? `
         <h3 class="section-title"><span>カードの引落予定</span></h3>
@@ -144,6 +151,12 @@ export function render(root) {
     else if (ds.investment) editInvestment(ds.investment, rerender);
     else if ('addProgram' in ds) editProgram(null, rerender);
     else if (ds.program) editProgram(ds.program, rerender);
+  });
+
+  section.querySelector('[data-bank-csv]').addEventListener('change', async e => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (file) importBankStatement(await file.arrayBuffer(), rerender);
   });
 
   section.querySelector('[data-holdings-csv]').addEventListener('change', async e => {
@@ -260,6 +273,196 @@ function setupAccounts(onDone) {
       toast('残高を保存しました');
       onDone();
     });
+  });
+}
+
+// -------------------------
+// 銀行の入出金明細（CSV）の取り込み
+// ATM の出し入れは財布との「移動」、それ以外は収入・支出として記録する
+// -------------------------
+
+const BANK_STATUS = {
+  imported: '取り込み済み',
+  manual: '手入力あり',
+  cardbill: 'カードの引き落とし'
+};
+
+export function importBankStatement(buffer, onDone) {
+  const data = getData();
+  if (bankAccounts(data).length === 0) {
+    toast('先に設定で銀行を追加してください');
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = parseBankCsv(decodeCsv(buffer));
+  } catch (e) {
+    console.error(e);
+  }
+  if (!parsed || parsed.rows.length === 0) {
+    toast('明細が見つかりませんでした。ゆうちょダイレクトの入出金明細の CSV か確認してください');
+    return;
+  }
+
+  const banks = bankAccounts(data);
+  let bankId = (banks.find(a => a.name.includes('ゆうちょ')) || banks.find(a => a.id === defaultBankId(data))).id;
+  let syncBalance = parsed.currentBalance !== null;
+
+  let rows = [];
+  const refreshDuplicates = () => {
+    rows = markBankDuplicates(applyPastChoices(parsed.rows, data), data, bankId, accountOf).map((row, i) => ({
+      ...row,
+      category: rows[i]?.category ?? row.category,
+      detail: rows[i]?.detail ?? row.detail,
+      checked: !row.duplicate && !row.skipReason
+    }));
+  };
+  refreshDuplicates();
+
+  const statusOf = row => BANK_STATUS[row.duplicate] || BANK_STATUS[row.skipReason] || '';
+
+  const rowHtml = (row, i) => {
+    const status = statusOf(row);
+    let choice = '';
+    if (row.type === 'transfer') {
+      choice = `<div class="sub">🔁 ${row.direction === 'out' ? '財布へ移動（引き出し）' : '財布から移動（預け入れ）'}</div>`;
+    } else {
+      choice = `<select data-category="${i}" aria-label="カテゴリ">${options(data.categories[row.type], row.category)}</select>`;
+      if (row.category === 'その他') {
+        choice += `<input type="text" class="detail-input" data-detail="${i}" value="${esc(row.detail)}" placeholder="内容（例：手数料）" aria-label="「その他」の内容">`;
+      }
+    }
+    return `
+      <label class="list-row import-row${row.checked ? '' : ' unchecked'}">
+        <input type="checkbox" data-check="${i}"${row.checked ? ' checked' : ''} aria-label="${esc(row.memo)}を取り込む">
+        <div class="main">
+          <div class="title">${esc(row.memo)}</div>
+          <div class="sub">${formatDate(row.date)} ・ ${esc(row.kind)}${status ? ` ・ ${status}` : ''}</div>
+          ${choice}
+        </div>
+        <div class="amount ${row.direction === 'in' ? 'income' : ''}">${row.direction === 'in' ? '+' : '−'}${yen(row.amount)}</div>
+      </label>`;
+  };
+
+  const first = parsed.rows[0].date;
+  const last = parsed.rows[parsed.rows.length - 1].date;
+  const bankOptions = banks.map(a => `<option value="${esc(a.id)}"${a.id === bankId ? ' selected' : ''}>${esc(a.name)}</option>`).join('');
+  const syncField = parsed.currentBalance === null ? '' : `
+        <label class="check-field" style="margin-bottom:10px">
+          <input type="checkbox" name="sync" checked>
+          残高を明細の現在高 ${yen(parsed.currentBalance)} に合わせる
+        </label>`;
+
+  const body = `
+    <form id="bank-import-form">
+      <label class="field"><span>取り込む銀行</span><select name="bank">${bankOptions}</select></label>
+      <p class="note" style="margin:0 0 4px">${parsed.rows.length}件 ・ ${formatDate(first)}〜${formatDate(last)}</p>
+      <p class="note" id="bank-note" style="margin:0 0 10px"></p>
+      ${syncField}
+      <div class="list import-list" id="bank-rows"></div>
+      <p class="note">ATM や窓口での出し入れは、財布との「移動」として記録します。カードの引き落としは、カード明細の取り込みで記録済みなので外しています。</p>
+      <div class="btn-row sheet-actions">
+        <button type="submit" class="btn primary" id="bank-submit"></button>
+      </div>
+    </form>`;
+
+  openSheet('入出金明細の取り込み', body, (sheet, close) => {
+    const form = sheet.querySelector('#bank-import-form');
+    const list = sheet.querySelector('#bank-rows');
+    const submit = sheet.querySelector('#bank-submit');
+
+    const refreshSummary = () => {
+      const count = rows.filter(r => r.checked).length;
+      const counts = {};
+      for (const r of rows) {
+        const status = statusOf(r);
+        if (status) counts[status] = (counts[status] || 0) + 1;
+      }
+      const notes = Object.entries(counts).map(([label, n]) => `${label} ${n}件`);
+      sheet.querySelector('#bank-note').textContent = notes.length ? `⚠ ${notes.join('、')}はチェックを外しています。` : '';
+      if (count) submit.textContent = `${count}件を取り込む`;
+      else submit.textContent = syncBalance ? '残高だけ合わせる' : '0件を取り込む';
+      submit.disabled = count === 0 && !syncBalance;
+    };
+
+    const renderRows = () => {
+      list.innerHTML = rows.map(rowHtml).join('');
+      refreshSummary();
+    };
+
+    form.bank.addEventListener('change', () => {
+      bankId = form.bank.value;
+      refreshDuplicates();
+      renderRows();
+    });
+    if (form.sync) {
+      form.sync.addEventListener('change', () => {
+        syncBalance = form.sync.checked;
+        refreshSummary();
+      });
+    }
+
+    list.addEventListener('change', e => {
+      const el = e.target;
+      if (el.dataset.check) {
+        rows[el.dataset.check].checked = el.checked;
+        el.closest('.import-row').classList.toggle('unchecked', !el.checked);
+        refreshSummary();
+      } else if (el.dataset.category) {
+        rows[el.dataset.category].category = el.value;
+        renderRows();
+      }
+    });
+    list.addEventListener('input', e => {
+      if (e.target.dataset.detail) rows[e.target.dataset.detail].detail = e.target.value;
+    });
+
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const selected = rows.filter(r => r.checked);
+
+      update(d => {
+        for (const row of selected) {
+          const common = { id: uid(), date: row.date, amount: row.amount, memo: row.memo, importKey: row.importKey, createdAt: Date.now() };
+          if (row.type === 'transfer') {
+            d.transactions.push({
+              ...common,
+              type: 'transfer',
+              fromAccount: row.direction === 'out' ? bankId : WALLET_ID,
+              toAccount: row.direction === 'out' ? WALLET_ID : bankId
+            });
+          } else {
+            d.transactions.push({
+              ...common,
+              type: row.type,
+              category: row.category,
+              detail: row.category === 'その他' ? row.detail.trim() : '',
+              method: row.type === 'expense' ? '口座振替' : '',
+              card: '',
+              account: bankId,
+              merchant: row.merchant
+            });
+          }
+        }
+
+        // 明細の現在高を、この時点の銀行の残高にする
+        // （取り込んだ明細はすでに現在高に含まれているので、二重に数えないよう基準の時刻を後にする）
+        if (syncBalance) {
+          Object.assign(d.accounts.find(a => a.id === bankId), {
+            baseAmount: parsed.currentBalance,
+            baseDate: todayStr(),
+            baseAt: Date.now() + 1
+          });
+        }
+        snapshotAssets(d, todayStr());
+      });
+      close();
+      toast(selected.length ? `${selected.length}件を取り込みました` : '残高を合わせました');
+      onDone();
+    });
+
+    renderRows();
   });
 }
 
